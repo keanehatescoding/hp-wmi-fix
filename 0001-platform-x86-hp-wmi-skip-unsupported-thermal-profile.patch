@@ -1,0 +1,139 @@
+From 49f352a4ec7e019c1564bff795d64f4334068776 Mon Sep 17 00:00:00 2001
+From: keanehatescoding <159132270+keanehatescoding@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:53:25 +0300
+Subject: [PATCH] platform/x86: hp-wmi: skip unsupported thermal profile and
+ fan control
+
+On some HP business laptops, such as the HP 245 14 inch G10 Notebook
+PC, the generic thermal profile fallback path probes
+HPWMI_THERMAL_PROFILE_QUERY (0x4c) even though the BIOS does not
+support it. When the BIOS returns an error such as 0x6, hp-wmi logs:
+
+  hp_wmi: query 0x4c returned error 0x6
+
+and thermal_profile_setup() fails. The failure is already ignored by
+hp_wmi_bios_setup(), but the warning is noisy and the probe should be
+quiet when the feature is unsupported.
+
+Similarly, hp_wmi_hwmon_init() applies initial fan settings on systems
+that report a fan count but do not support the legacy fan speed max
+WMI command. On such systems this produces:
+
+  hp-wmi hp-wmi: Failed to apply initial fan settings: -22
+
+Add a quiet hp_wmi_perform_query() variant so unsupported thermal
+profile probes do not emit warnings. If the generic thermal profile
+query is not supported, skip platform profile registration.
+
+For legacy fan control systems where the BIOS does not support the fan
+speed max command, disable the fan hwmon attributes instead of warning
+during initialization.
+
+Reported-by: Keane <159132270+keanehatescoding@users.noreply.github.com>
+Tested-on: HP 245 14 inch G10 Notebook PC (BIOS F.16)
+Signed-off-by: Keane <159132270+keanehatescoding@users.noreply.github.com>
+---
+ drivers/platform/x86/hp/hp-wmi.c | 44 ++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/platform/x86/hp/hp-wmi.c b/drivers/platform/x86/hp/hp-wmi.c
+index 52077833a..e0bb828b3 100644
+--- a/drivers/platform/x86/hp/hp-wmi.c
++++ b/drivers/platform/x86/hp/hp-wmi.c
+@@ -730,8 +730,9 @@ static inline int encode_outsize_for_pvsz(int outsize)
+  *       buffer = kzalloc(128, GFP_KERNEL);
+  *       ret = hp_wmi_perform_query(HPWMI_BATTERY_QUERY, HPWMI_READ, buffer, 1, 128)
+  */
+-static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
+-				void *buffer, int insize, int outsize)
++static int __hp_wmi_perform_query(int query, enum hp_wmi_command command,
++				   void *buffer, int insize, int outsize,
++				   bool quiet)
+ {
+ 	struct acpi_buffer input, output = { ACPI_ALLOCATE_BUFFER, NULL };
+ 	struct bios_return *bios_return;
+@@ -772,7 +773,9 @@ static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
+ 
+ 	if (obj->type != ACPI_TYPE_BUFFER ||
+ 	    obj->buffer.length < sizeof(*bios_return)) {
+-		pr_warn("query 0x%x returned wrong type or too small buffer\n", query);
++		if (!quiet)
++			pr_warn("query 0x%x returned wrong type or too small buffer\n",
++				query);
+ 		ret = -EINVAL;
+ 		goto out_free;
+ 	}
+@@ -781,7 +784,8 @@ static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
+ 	ret = bios_return->return_code;
+ 
+ 	if (ret) {
+-		if (ret != HPWMI_RET_UNKNOWN_COMMAND &&
++		if (!quiet &&
++		    ret != HPWMI_RET_UNKNOWN_COMMAND &&
+ 		    ret != HPWMI_RET_UNKNOWN_CMDTYPE)
+ 			pr_warn("query 0x%x returned error 0x%x\n", query, ret);
+ 		goto out_free;
+@@ -801,6 +805,13 @@ static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
+ 	return ret;
+ }
+ 
++static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
++				void *buffer, int insize, int outsize)
++{
++	return __hp_wmi_perform_query(query, command, buffer, insize, outsize,
++				      false);
++}
++
+ /*
+  * Calling this hp_wmi_get_fan_count_userdefine_trigger function also enables
+  * and/or maintains the laptop in user defined thermal and fan states, instead
+@@ -2760,10 +2771,15 @@ static int thermal_profile_setup(struct platform_device *device)
+ 
+ 		ops = &platform_profile_victus_s_ops;
+ 	} else {
+-		tp = thermal_profile_get();
++		int val = 0;
+ 
+-		if (tp < 0)
+-			return tp;
++		err = __hp_wmi_perform_query(HPWMI_THERMAL_PROFILE_QUERY,
++					     HPWMI_READ, &val, zero_if_sup(val),
++					     sizeof(val), true);
++		if (err)
++			return 0;
++
++		tp = val;
+ 
+ 		/*
+ 		 * call thermal profile write command to ensure that the
+@@ -2771,7 +2787,7 @@ static int thermal_profile_setup(struct platform_device *device)
+ 		 */
+ 		err = thermal_profile_set(tp);
+ 		if (err)
+-			return err;
++			return 0;
+ 
+ 		ops = &hp_wmi_platform_profile_ops;
+ 	}
+@@ -3222,8 +3238,16 @@ static int hp_wmi_hwmon_init(void)
+ 	}
+ 
+ 	ret = hp_wmi_apply_fan_settings(priv);
+-	if (ret)
+-		dev_warn(dev, "Failed to apply initial fan settings: %d\n", ret);
++	if (ret) {
++		if (!hp_wmi_fan_control_supported() && ret == -EINVAL) {
++			dev_dbg(dev,
++				"Fan control not supported by BIOS, disabling fan support\n");
++			priv->fan_count = 0;
++		} else {
++			dev_warn(dev, "Failed to apply initial fan settings: %d\n",
++				 ret);
++		}
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.56.1
+
