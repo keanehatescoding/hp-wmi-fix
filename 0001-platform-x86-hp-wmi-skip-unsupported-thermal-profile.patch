@@ -97,7 +97,7 @@ index 52077833a..e0bb828b3 100644
 -		if (tp < 0)
 -			return tp;
 +		err = __hp_wmi_perform_query(HPWMI_THERMAL_PROFILE_QUERY,
-+					     HPWMI_READ, &val, zero_if_sup(val),
++					     HPWMI_READ, &val, 0,
 +					     sizeof(val), true);
 +		if (err)
 +			return 0;
